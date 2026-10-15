@@ -112,6 +112,49 @@ pub fn is_private_or_local(ip: IpAddr) -> bool {
     }
 }
 
+/// Addresses that stay refused even for a host listed in
+/// `security.allowed_private_hosts`: link-local (the cloud metadata
+/// range `169.254.0.0/16`, `fe80::/10`), the AWS IPv6 IMDS address
+/// `fd00:ec2::254`, unspecified, multicast and broadcast. The
+/// allowlist exists for cluster-internal services on RFC 1918 / ULA
+/// / loopback addresses; none of them legitimately live here.
+pub fn is_always_blocked(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_link_local() || v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_always_blocked(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            v6.is_unspecified()
+                || v6.is_multicast()
+                || seg[0] & 0xffc0 == 0xfe80
+                || seg == [0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254]
+        }
+    }
+}
+
+/// Normalise one `security.allowed_private_hosts` entry for exact
+/// matching against a URL host: trimmed, lowercased, trailing dot
+/// dropped. Returns `None` for entries that can never match a
+/// hostname — empty, IP literals (literal private IPs are refused at
+/// DSL load; use `block_private_networks=false` for those), or
+/// anything carrying a scheme, port, path, userinfo or whitespace.
+pub fn normalize_allowed_host(entry: &str) -> Option<String> {
+    let host = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty()
+        || host.parse::<IpAddr>().is_ok()
+        || host
+            .chars()
+            .any(|c| matches!(c, ':' | '/' | '@' | '[' | ']') || c.is_whitespace())
+    {
+        return None;
+    }
+    Some(host)
+}
+
 /// Sanitize a byte string for structured log output. Replaces
 /// CR/LF and control bytes with `\r` / `\n` / `\uXXXX` escapes so
 /// that:
@@ -468,6 +511,49 @@ mod tests {
         let s = "hello\tworld äöü 🚀";
         let out = sanitize_for_persistence(s);
         assert_eq!(out, s);
+    }
+
+    #[test]
+    fn normalize_allowed_host_accepts_plain_hostnames() {
+        assert_eq!(
+            normalize_allowed_host(" Ruuter-Internal. ").as_deref(),
+            Some("ruuter-internal")
+        );
+        assert_eq!(
+            normalize_allowed_host("svc.ns.svc.cluster.local").as_deref(),
+            Some("svc.ns.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn normalize_allowed_host_rejects_non_hostnames() {
+        for bad in [
+            "",
+            "  ",
+            "10.0.0.1",
+            "::1",
+            "[::1]",
+            "ruuter-internal:8080",
+            "http://ruuter-internal",
+            "ruuter internal",
+            "user@ruuter-internal",
+        ] {
+            assert!(normalize_allowed_host(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn always_blocked_covers_metadata_not_cluster_ranges() {
+        assert!(is_always_blocked(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_always_blocked(IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254
+        ))));
+        assert!(!is_always_blocked(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_always_blocked(IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x253
+        ))));
     }
 
     #[test]
